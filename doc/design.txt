@@ -1,0 +1,611 @@
+Performance
+-----------
+On Roger's MacBook Pro, optimized client/server takes 64 microseconds
+for round trip, or 32 microseconds for a send through localhost.
+
+2nd try: liblo 33us per send
+
+with -O3 optimization, liblo is 23us per message
+
+with -O3 and non-blocking receive, liblo is 17.5us
+
+
+O2 takes 40s for 1M messages round trip -> 40us per round trip or 20us
+for a send through localhost
+
+With non-blocking poll(), O2 takes 14us per message
+
+With poll() and 1ms timeout, O2 takes 24us per message in debug version
+ 
+With blocking_hack which set timeout to -1, O2 takes 21us per message  
+
+June 8: 1M messages in 48.95s -> 49us/round-trip on 3GHz Core i7
+but on my 2.4GHz Core i7 OS X 10.7.5, round-trip was 29us, so that's
+15us per message.  
+
+Message Handling
+----------------
+For non-pattern messages, just use a hash table for whole pattern including
+service name.
+
+For pattern messages, use a tree and match each node. Each node in the tree
+is a dictionary of keys to either handler or another node.
+
+The dictionary should be a hash table with linked overflow to simplify
+deletions. The dictionary should have between 2 and 3 times as many locations
+as data items.
+
+Discovery Protocol
+------------------
+New processes broadcast to 5 ports in sequence, initially every 0.33s
+but increase the interval by 10% each time until a maximum interval of
+4s is reached. This gives a message every 40ms on average when there
+are 100 processes. Also gives 2 tries on 5 ports within first 2s.
+
+In addition to sending broadcast messages, we send messages to
+localhost because broadcast messages (at least on OS X) are not
+received on the same machine. The locolhost messages are sent at the
+same times as the broadcast messages and to the same ports, except
+that there is no need to send localhost messages to a process's own
+discovery port.
+
+When a discovery message arrives, we check:
+1) if the application name does not match, ignore the message
+2) if the IP:PORT string is already in the master_table (as a process)  
+   do no further processing
+3) if the IP:PORT string (process name) in the message is lower than
+   the receiver's name, do not process the message, but send a
+   discovery message back to the sender.
+4) Otherwise, create a process descriptor in master_table and initiate
+   a connection to the process.
+
+Connection is made via TCP. Since we want to share the clock
+synchronization states, the connecting process must send clock state
+as well as its name (because it cannot know if any previous discovery
+message was sent or received) and UDP port. The connected-to process
+must have gotten a discovery message to the connecting process
+(otherwise the connection would not take place), but we do not know
+when the message was sent and the clock synchronization state might
+have changed in the interim, so there's no use sending clock state
+with discovery messages. Instead, the connected-to process will send a
+status message to the connecting process.
+
+Summary: discovery messages need only send IP and TCP server
+ports. Processes are named by strings of the form "128.2.1.50:54321"
+and the higher name (using strcmp()) connects to the lower name. After
+the TCP connection is established, *both* processes send their
+endianness (as "l" or "b"), IP, TCP port, UDP port, and clock
+synchronization state.
+
+Connection Walkthrough
+----------------------
+
+Processes are connected two ways: connect and accept.
+
+For the connect case, the sequence starts with the receipt of a
+discovery message, handled by:
+  - o2_discovery_handler: A process entry is created by
+    - add_remote_process with state PROCESS_CONNECTING. The tcp
+      socket is then created using
+    - make_tcp_connection which makes a socket with
+      - make_tcp_recv_socket and is connected to the remote process.
+    After connection, the status becomes PROCESS_CONNECTED.
+    We send the !_o2/in initialization message using 
+    - o2_send_by_tcp. 
+    We then send services to the remote process.  
+    When we made the socket, the handler was set to
+  - tcp_initial_handler, which calls
+    - o2_discovery_init_handler. This function updates the process
+      entry with tcp_port (TODO: not needed?), the udp_port,
+      the process status (either PROCESS_OK or PROCESS_NO_CLOCK,
+      depending on the clock sync information from the incoming
+      message), and the udp_sa socket address which is used to
+      send UDP messages.
+      
+
+For the accept case, we just add the newly accepted socket and set the
+handler to
+  - tcp_initial_handler. At this point, there is no process entry.
+    The tcp_initial_handler ensures the incoming !_o2/in message is
+    complete and passes it off to
+    - o2_discovery_init_handler. This function does a lookup on the
+      process entry and discovers it is not there, so it makes
+      one with
+      - add_remote_process. The process entry is intialized and the
+        status becomes either PROCESS_OK or PROCESS_NO_CLOCK.
+      We send the !_o2/in initialization message using 
+      - o2_send_by_tcp. 
+    We then send services to the remote process.
+
+
+Connect and Status
+------------------
+We want to create @public:local:port service names as soon as we
+"discover" a process so that a future discovery does not try to make a
+second connection. Adding "@..." as a service serves to prevent
+re-discovery of the same process.
+
+However, with Bonjour/ZeroConf, we can "discover" a non-existent
+process. This service can exist briefly as a TCP connection that is
+asynchronously connecting.  Unfortunately, the original implementation
+of discovery would announce this immediatly via an /_o2/si message,
+allowing the application to send messages. (Any messages would block
+or be queued and eventually freed when the connection hangs up.)
+
+To avoid this anomalous behavior, note that there can only be one
+process overing any given "@..." service, so it is OK to add the
+service. However, when a service becomes "active" (first on services
+list, i.e. when the "@..." service is created), we must check to see
+if the service is truly connected before sending /_o2/si.
+
+Later, when the socket becomes connected, we must send /_o2/si.
+
+Also, when o2_status() is called, we must report O2_FAIL for any
+not-yet-connected process.
+
+For MQTT connections, we will assume that discovery is only through
+MQTT, so if a process name exists as a service, we will assume the
+process exists.
+
+Services
+--------
+After making a connection, the connecting process sends all local
+services. If a new service is added, all connected processes are sent
+information about the new service. Similarly if a service is removed,
+all connected processes are sent a "remove service" message.
+
+Process State Protocol
+----------------------
+Internally, remote process descriptors go through a sequence of
+states:
+* PROCESS_DISCOVERED - a discovery message has revealed this process.
+* PROCESS_CONNECTING - a connection request has been issued.
+* PROCESS_CONNECTED - the connection has been completed, waiting for
+                      the initial status message.
+* PROCESS_NO_CLOCK - the process status message has arrived, and the
+                     process does not yet have clock sync. 
+* PROCESS_OK - the process status message has arrived and the process
+               has clock sync.
+
+The local process (o2_process) is initialized with the state
+PROCESS_NO_CLOCK and when it either becomes the master or clock
+synchronization is achieved the state changes to PROCESS_OK.
+
+Initially, processes have no clock and no services. Status information
+is obtained on a per-service basis using
+    o2_status("service-name")
+which initially will return O2_FAIL.
+
+Periodically, the clock_sync "thread" (which is just a scheduled
+handler that reschedules itself periodically to do clock sync
+activities) checks the status of the "_cs" service.  When it exists
+locally, clock sync is achieve implicitly. When it exists remotely,
+clock synchronization starts, and after some time, it will be
+established.
+
+For local services, the status values are:
+* O2_LOCAL_NOTIME - the service is local, but we cannot send scheduled  
+    messages because we do not have a synchronized clock  
+* O2_LOCAL - the service is local, and timed messages will work  
+ 
+For remote services, the status values are:
+* O2_REMOTE_NOTIME - the service is remote, but we cannot send scheduled 
+    messages because we do not have a synchronized clock 
+* O2_REMOTE - the service is remote, and timed messages will work 
+
+To implement the remote status, we need to know if the *remote*
+process has clock synchronization. Therefore, when clock
+synchronization is achieved, a process will send a message to all
+connected processes "register" the fact that they are
+synchronized. When connecting to a new process, the discovery info
+will include clock synchronization status.
+
+Clock Synchronization
+---------------------
+
+Processes request time from the application-designated "clock
+reference" service named _cs. The reference time is estimated to be
+the retrieved time minus half the round-trip time to retrieve it. To
+make time more quickly accessible, we store the offset between local
+and global (reference) time and just re-estimate global time using the
+offset. Several problems remain: estimation errors due to dropped
+messages or asymmetric network latency, minimizing startup delays,
+clock drift, and avoiding jumps in time when the clock is updated.
+
+- Avoiding Estimation Errors. To avoid estimation errors due to
+network delays, we estimate the time 5 times and use the estimate
+based on the lowest round-trip time. (This is provably better than
+averaging estimates.)
+
+- Dealing With Clock Drift. To deal with clock drift, we run the clock
+synchronization protocol constantly, requesting the reference time
+every 10 sec or so. Cheap crystal clocks are rated at an error of
+about 50ppm, which is 0.000050 = 0.005%. Things can be much worse in
+practice. We assume 0.01%.  10 sec is based on a clock rate error of
+0.01%, which accumulates to 10 * 0.0001 = 1 msec of drift. The
+tradeoff is that at 10 sec per time request, 100 processes generate 10
+round-trip clock requests per second, which seems acceptable but
+already putting some load on the network, especially WiFi.
+
+- Minimizing Startup Delays. To get the initial estimates without a 50
+sec wait, we request reference times more frequently when the process
+first discovers the _cs service. Then we "back off" to infrequent
+updates to reduce network bandwidth.  The "ideal" plan is to make 5
+requests at 0, 0.1 0.2, 0.3, 0.4 sec, then every 0.5 sec at 0.9, 1.4,
+... 4.9, then every 10 sec at 19.4, 29.4, ....
+
+If a time request reply is not received before the next request time,
+we simply send another request and ignore the reply if it arrives
+later. (All requests and replies have serial numbers to match them
+up.)  Wide-area requests can experience ping times of up to around 400
+msec, so it is possible that the first 4 time requests will return too
+late to be used. This means that effectively, we start the clock sync
+protocol at 0.4 sec, and it will take 2 (plus the response time)
+seconds to make 5 reference clock time estimates vs. the theoretical
+optimum of 4 * response time, which could be anywhere from 0.4 to 1.6
+secs. So at least we are within a factor of 2 of optimal, and in
+absolute terms, we could at best hope to improve by about 2 seconds.
+Note that if UDP packets are dropped, all bets are off, and it could
+take much longer to synchronize, but that is why we send 14 requests
+in the first 5 seconds -- we only need 5 replies to get started.
+
+- Avoiding Jumps When the Clock Is Updated. Global time is computed
+as a linear function from local time to global time with slope close
+to 1 and an offset to account for the difference between global and
+local clocks. After the initial acquisition of the reference time, we
+want the time to increase monotonically and smoothly so that, for
+example, if we want to make a musical note with a duration of 100
+msec, and the reference clock is re-estimated to be 50 msec ahead of
+our previous estimate, we do not want time to instantly jump forward
+by 50 msec, which would shorten the note from 100 to 50 msec. Instead,
+we speed up or slow down by 10% using our linear mapping, so in this
+case, the adjustment would take 500 msec, and the 100 msec note would
+be shortened to 90 msec. At least in music perception, a 10% tempo
+change is small and might not even be noticed if it lasts less than 1
+sec.
+
+Unfortunately, larger jumps can occur, especially if the clock
+reference goes off-line and a new one is created. When the jump is
+greater than 1 sec forward, we simply set the clock ahead, and when
+the jump is greater than 1 sec backward, we stop the clock and wait
+for the global time to match our current scheduler time; then we
+resume the clock.
+
+Since jumping and/or stopping are not the right decisions for
+everyone, an override is possible. Before taking any action, a message
+is sent to /_o2/cs/jp with the current local time, the prior global
+time estimate, and the new global time estimate, which differs by more
+than 1 sec.  An application message handler can use this information
+to enact different policies. Possible actions are:
+
+o2_schedule_flush() removes any scheduled messages in o2_gtsched, the
+global time scheduler (the local scheduler contains internal O2
+messages and cannot be flushed).
+
+o2_schedule_sendall() dispatches all scheduled messages in
+o2_gtsched, even though their timestamps are in the future.
+
+o2_clock_jump(bool adjust) immediately sets the mapping so that local
+time maps to our current best estimate of global time. When handling
+/_o2/cs/jp, if the estimated global time has jumped backward, this
+will set the clock back to the correct global time instead of stopping
+the clock and waiting for global time to "catch up." Furthermore, if
+adjust is true, timestamps in scheduled messages (which previously
+were all in the future) will be adjusted forward or backward according
+to the clock change. For example, if a message is scheduled for 1 sec
+in the future and the clock is adjusted backward, then after the call,
+the message timestamp will be lower so that it will still be scheduled
+for 1 sec in the future. Similarly, if time jumps forward, timestamps
+are incremented by the amount of the jump so they remain scheduled for
+the future.
+
+
+Messages
+--------
+
+!_o2/dy "sssii" b_or_l_endian application_name ip tcp_port udp_port
+        o2_discovery_handler(): message arrives by UDP broadcast or a
+        send to localhost; this is a notification that another O2
+        process exists. The tcp_port is the server port listening for
+        connections. The udp_port is the discovery port.
+
+!_o2/in "ssiii" b_or_l_endian ip tcp_port_number udp_port_number clocksync
+        o2_initial_handler(): message arrives via tcp to initialize
+        connection between two processes. clocksync is true (1) if the
+        process is already synchronized to the master clock
+
+!_o2/sv "s..." process_name service1 service2 ...
+        o2_services_handler(): message arrives via tcp to announce the
+        initial list or an additional service
+
+!_o2/sd "ss" process_name service
+        o2_service_delete_handler(): message arrives via tcp to
+        announce the service has been deleted from the sending process
+
+!_o2/ds ""
+        o2_discovery_send_handler(): (no arguments) send next
+        discovery message via broadcast and send to localhost
+
+!_o2/ps ""
+        o2_ping_send_handler(): (no arguments) send next ping message
+        to clock service (_cs)
+
+!_cs/get "is" serial_no reply_to
+        o2_ping_handler(): sends serial_no and master clock time back
+        to sender by appending "/get-reply" to the reply_to argument
+        to form a reply path.
+
+<path>/get-reply "it" serial_no master_time
+        o2_ping_reply_handler(): receive the time read from the master
+        clock (via udp) in response to a !_cs/get message.
+
+
+Extensions
+----------
+
+o2_tap(const char *tappee, const char *tapper,
+       O2tap_send_mode send_mode) -- request a copy of 
+    each message delivered to tappee (a service). The message is
+    retransmitted to tapper (another service) by replacing the
+    service name in the address and sending the message. The
+    implementation works by adding info about the tapper into the
+    array of services (services_entry) for tappee (in every process).
+    The services_entry list is sorted as follows:
+    The actual service provider is first. The next entries are
+    tappers. After the tappers follow all the non-active service
+    providers.
+
+    When a message is received for the service and the actual provider
+    is remote, just send the message to the actual provider. If the
+    actual provider is local, resend the message to each tapper (if
+    any). The messages are sent  reliably or not depending on send_mode.
+
+    The tapper will see all messages actually delivered to the service
+    in the order in which they are delivered, and with the original
+    timestamps, but of course, the tapper will receive the messages 
+    later than the tappee. One exception is when a service is
+    delegated to an OSC server. In that case, bundles (because they
+    have timestamps) are forwarded immediately to the OSC server and
+    the actual delivery order of the bundle is unknown to
+    O2. If there is a tapper, the OSC bundle is converted back to an
+    O2 bundle addressed to the tapper, and the bundle is sent
+    immediately; this may cause the bundle and/or components to arrive
+    early, be scheduled, and be delivered to the tapper in a different
+    order than that seen by the OSC server. On the other hand, bundles
+    delivered to O2 services are decomposed into individual messages
+    and forwarded to the tapper individually.
+    
+    When a service disappears, it should no longer be a
+    tapper, so (for now), we will search all service entries for
+    them. When a tappee disappears, there may be another service
+    offering that replaces it. This would have to be in a different
+    process. When the service changes over to this new process,
+    messages to it will be forwarded to the tapper. There are race
+    conditions; for example the tapper cannot distinguish old tappee
+    messages from new tappee messages except by noticing that the old
+    tappee has been deleted, but deleting the old tappee is not a
+    system-wide atomic operation, so the old tappee status could be
+    unchanged at the tapper process even while the tapper is receiving
+    messages from the new tappee.
+
+    An alternative design: o2_subscribe(service)
+    announces service to all. Unlike normal services, where the
+    message is sent to the "highest ranked" service when there are
+    duplicates, subscribers are kept as a separate list so to deliver
+    to a service, you send to the highest ranked "normal" service AND
+    you send the same message to each subscriber. A problem with this
+    approach is that messages could arrive to each subscriber in a
+    different order. By using o2_tap() and resending messages, all
+    messages will be received in the same order at the tapper as in
+    the original tappee.
+
+    Another design question was whether to send future timestamped
+    messages to the tapper immediately, allowing the tapper to receive
+    messages at exactly the same logical time as the tappee in the
+    forward synchronous cases. This would create a situation where a
+    mix of immediate and future timestamps could be received in a
+    different order at the tapper. Since the main use of the tapper
+    mechanism is debugging and monitoring, it seems more valuable to
+    have a record of messages in their correct order (and also in the
+    case of UDP, to know which messages are actually delivered.)
+
+    This leaves the use case of "multiple subscribers" unaddressed. We
+    have "many-to-one" messaging by allowing anyone to send to a
+    service, but we do not have "one-to-many" messaging where multiple
+    subscribers can receive from a "publisher." We propose handling
+    this in the application: A "publisher" is just a service. Any
+    subscriber process can send a service name to the publisher using
+    a message of the form /publisher/subscribe "subscriber". The
+    publisher keeps a list of subscribers (service names) and sends
+    ("publishes") messages by sending to each of the subscribers. The
+    publisher can also monitor the status of subscribers. When the
+    subscriber (a service name) no longer exists, the publisher can
+    drop the subscriber from its list.  A simpler scheme uses taps:
+    The publisher creates the publication as a local service.
+    Subscribers subscribe to the service. To publish, just send a
+    local message to the publication service name. All tappers will
+    receive a copy of the message. Of course, all messages to the
+    service are tapped, so you are really publishing to the whole
+    address space below the service.
+
+!_o2/si "sis" service_name new_status ip_port
+    This message is internally generated for the benefit of the
+    application. It provides "service information" (hence the "si"
+    address) when a service is discovered, destroyed, or its state
+    changes. The ip_port string gives the current service provider. (A
+    message is generated also if this changes. In that case, you would
+    also get an !_o2/si message about the old provider process being
+    destroyed since processes are services too, named by their ip:port
+    string.)
+
+!ip:port/cs/rt "s" reply_to
+    Request the mean and min round-trip time from the clock
+    synchronization protocol being run by the process named by
+    ip:port. The reply is sent to the address formed by appending
+    /get-reply to the reply_to argument. The reply message has type
+    string "sff" and contains the ip_port of the receiver, the mean 
+    and min from o2_roundtrip().
+
+Web Monitor
+-----------
+
+Some notes on creating a web-based monitor. The monitor should connect
+to a server that runs O2. The server is normally a local process, so
+the "website" will be "localhost:12345" or some such port.
+
+The web page should display a table of 
+    process name (ip:port)
+    service name
+    checkbox for tapping messages to this service
+    service status
+    clock sync statistics (only displayed where service name is the
+        process name
+    
+Also display a list of messages received from the tappees. Messages
+should be displayed as timestamp, original address (reconstructed from
+the actual address), typestring, and data values.
+
+Bonjour
+-------
+
+Goal: Provide an O2lite interface through WebSockets to browsers.
+
+Browser will open ws://ensemble-name.local. to get a websocket. As
+with all O2lite connections, there is no preference for the host --
+any one will do. Once connected, the browser can use O2lite to offer
+services and to reach any O2 service in the ensemble.
+
+But this does not work -- apparently, you can connect via HTTP using
+the local host name, e.g. rbd-mac.local. works to connect to a local
+server, but if I register another name with dns-sd, e.g.
+  dns-sd -R o2test _http local 8888
+and try to visit http://o2test.local.:80/, the browser does not
+resolve the name.  
+
+Possible solution: Use bonjour api to create A record for a new host
+name, and use port 8080. Then open the name as http://name.local.:8080
+The HTTP service there could then serve a page with
+ws://xxx.x.x.x:port/ws as a web socket, so we have a direct IP address
+for opening the O2lite-over-websocket connection.
+
+This works:
+dns-sd -P "o2test" _o2proc._tcp. local 80 o2test.local 192.168.1.166 some text
+and allows the URL http://o2test.local. to open a web page. Using the
+URL ws://o2test.local.:80/ws fails as a websocket address even though
+ws://rbd-mac.local.:80/ws works using the actual assigned host name.
+ws:192.168.1.166:80/ws DOES work in this case.   
+
+If this works, we could actually replace O2's discovery with Bonjour.
+Obsolete, see next paragraph:
+    The goal would be to make a new type _o2ensemble._tcp where
+    ensemble is the ensemble name, and have O2 processes create
+    services where the service name is the process name,
+    e.g. @xxxxxxxx:yyyyyyyy:zzzz. We can announce the service as being
+    at port zzzz to avoid collisions in case Bonjour cares.
+That's pretty much all there is to it, but we still need some dy
+(discovery) message handling for MQTT protocol connections and for the
+case where broadcasting is disabled.
+
+Except on macOS, applications must declare the services they browse,
+so we cannot use O2 ensemble names as service types since they are not
+known in advance. Therefore we must use a fixed service name (but
+there will be many offers, so they'll get numbered.) So instead, use:
+      _o2proc._tcp
+Then, services might as well be the ensemble name with digits
+appended. (So don't name your ensemble "foo (1)"). Each o2proc can
+then add the process name as text.
+
+Getting information from Bonjour is a little more difficult than in
+O2's original discovery mechanism. You can only get one resolve
+callback for each name, and each O2 process will have a different
+name: "ensname", "ensname (2)", "ensname (3)", etc. Thus we have to
+"resolve" each name to information individually. To keep from
+opening 100 sockets to get information, we should handle them
+sequentially, but names from browse may come in a burst, so we
+need to store all the names in some sort of queue; then we can
+sequentially get a name from the queue and resolve it to get an
+IP address. Finally, we can directly contact the process make a
+TCP connection using the existing discovery message (/_o2/dy).
+
+What if we do not get a browse event? E.g. perhaps a process dies and
+comes back up, but the lifetime of the service info is such that
+nothing changes with Bonjour and no event is generated. In that case,
+we would drop our connection to the process and it would be up to the
+other process to re-establish connections. That seems OK -- when the
+process comes up, all names will be new and it will connect to all of
+them. It *does* mean that higher IP addresses need to initiate
+connections by sending O2_DY_CALLBACK messages as we do now.
+
+This simplifies resolving names. We can just use a Vec and push/pop
+names there. All we need to store is a string, so we just need a
+Vec<const char *> structure.
+
+For O2lite, we also have to announce services consistent with
+Bonjour. It looks like ESP32 has a library.
+
+For O2lite on macOS/Win/Linux, we'll have to use Bonjour, so it's not
+so "lite" to do discovery, but it's all hidden in the o2lite library and
+mostly handled by the Bonjour server.
+
+
+Executable Size
+---------------
+Here are some executable sizes. Created with Xcode, with optimization
+on.
+"OSC penalty" means how much more memory is used for O2 compared to
+liblo. "Basic OSC penalty" is to get minimal OSC from O2. "Full OSC
+penalty" is to get full OSC implementation from O2.
+
+"All vs. liblo" is the size of full O2 vs liblo.
+
+
+Minimal (no patterns, osc, hub, bundles, o2lite, shared mem, or zeroconf)
+  o2client            142880
+  o2server            142816
+  lo_oscsend           84064     avg: 84152
+  lo_oscrecv           84240
+                                58696   70%
+OSC  
+  o2client            148720
+  o2server            148672
+                                 5848    3.4%    
+Basic OSC penalty               64544   77%
+
+Patterns
+  o2client            153088
+  o2server            148896     
+                                 2296    1.5%
+Bundles  
+  o2client            153232     
+  o2server            153184     
+                                 2216    1.5%
+Full OSC penalty                69056   82%
+Hub
+  o2client            161408
+  o2server            161360
+                                 8176    5.3%
+O2lite
+  o2client            165872  
+  o2server            165808  
+                                 4456    2.7%  
+Shared mem
+  o2client            165872  
+  o2server            165808  
+                                    0    0%
+Zeroconf instead of O2discovery
+  o2client            167168 
+  o2server            167120 
+                                 5576    3.4%  
+All but Hub, Bundles, Patterns
+  o2client            162672
+  o2server            162608      
+                      162240
+
+All vs. Liblo
+                                78488   93%
+
+Message Print and Debug
+  o2client            198048 
+  o2server            198000
+  
+

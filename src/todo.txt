@@ -1,0 +1,27 @@
+Bugs:
+    massive printout for HTTP
+    if websocket client tries to initialize with wrong ensemble name, 
+        server closes connection and crashes
+    does clock sync work over http? When I wait for O2_LOCAL status,
+        I never get it, even though I see clock sync messages. Maybe
+	it works now after calling o2_set_clock().
+    After ^C running ~/soundcool/imuo2/soundcool_imu.bug.srp, there's
+        a segfault.
+    verbose output when running a websocket o2lite connection
+    ESP32 does not reconnect when o2 host reboots
+    HTTP is really slow for big files. Order of 100KB/s for localhost
+        (no network). Maybe blocks are too small.
+    compare o2sm_dispatch to o2_msg_deliver -- it looks like at least
+            there's a bug in o2sm_dispatch with conditional
+            compilation around message to the service itself.
+        
+    
+
+Tests we need:
+    see if multiple O2lite clients can connect
+    see if O2lite clients can discover host with their own discovery
+        messages
+    see if O2lite clients can use host discovery messages
+    see if multiple O2sm client threads work
+    test TTL feature and tap loops
+
